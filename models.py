@@ -3,18 +3,20 @@ models.py
 ---------
 All ML models for projectile trajectory prediction.
 
-  1. ProjectilePINN  - Physics-Informed Neural Network (NumPy/SciPy)
-  2. LSTMPredictor   - Sequence-to-sequence LSTM (NumPy/SciPy, no PyTorch)
+  1. ProjectilePINN  - Physics-Informed Neural Network (PyTorch)
+  2. LSTMPredictor   - Sequence-to-sequence LSTM (NumPy/SciPy)
   3. predict_all()   - Run all models + baselines, return comparison dict
 """
 
 import numpy as np
+import torch
+import torch.nn as nn
 from scipy.optimize import minimize
 from physics import parabolic_fit, KalmanTracker, G, RHO
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Shared MLP utilities (plain NumPy)
+# Shared NumPy MLP utilities (used by LSTMPredictor only)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _pack(layers):
@@ -35,11 +37,6 @@ def _fwd(t, layers):
         a = np.tanh(z) if j < len(layers)-1 else z
     return a
 
-def _d(t, layers, order=1, h=1e-5):
-    if order == 1:
-        return (_fwd(t+h, layers) - _fwd(t-h, layers)) / (2*h)
-    return (_fwd(t+h, layers) - 2*_fwd(t, layers) + _fwd(t-h, layers)) / h**2
-
 def _xavier(sizes, rng):
     out = []
     for a, b in zip(sizes, sizes[1:]):
@@ -49,20 +46,42 @@ def _xavier(sizes, rng):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 1. PINN  (Physics-Informed Neural Network)
+# 1. PINN  (Physics-Informed Neural Network — PyTorch)
 # ═════════════════════════════════════════════════════════════════════════════
+
+class _PINNNet(nn.Module):
+    """Inner PyTorch network: t (scalar, normalised) → [x_n, y_n]"""
+    def __init__(self, hidden, neurons):
+        super().__init__()
+        layers = [nn.Linear(1, neurons), nn.Tanh()]
+        for _ in range(hidden - 1):
+            layers += [nn.Linear(neurons, neurons), nn.Tanh()]
+        layers += [nn.Linear(neurons, 2)]
+        self.net = nn.Sequential(*layers)
+
+        # Learnable physics parameters (unconstrained; we use abs() where needed)
+        self.log_CD  = nn.Parameter(torch.tensor(0.0))   # log(CD)
+        self.log_om  = nn.Parameter(torch.tensor(3.4))   # log(omega) ≈ 30 rad/s
+
+        # Xavier init
+        for m in self.net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, t):
+        return self.net(t)
+
 
 class ProjectilePINN:
     """
     2-D PINN: maps t → (x(t), y(t)).
-    Simultaneously learns NN weights + drag coefficient + spin rate.
-
-    Based on: Chiha et al., CBMI 2024
-    Extended for any projectile via config dict.
+    Uses PyTorch autograd for exact PDE residuals (following Chiha et al. 2024).
+    Learns NN weights + drag coefficient + spin (if applicable).
     """
 
-    def __init__(self, cfg, hidden=3, neurons=20,
-                 beta=1e-3, n_coll=200, max_iter=5000, seed=42):
+    def __init__(self, cfg, hidden=4, neurons=32,
+                 beta=1e-3, n_coll=300, max_iter=3000, seed=42):
         self.cfg      = cfg
         self.hidden   = hidden
         self.neurons  = neurons
@@ -73,120 +92,164 @@ class ProjectilePINN:
         self._trained = False
         self.loss_history = []
 
-    def _norm_t(self, t): return (t-self._t0)/(self._dt+1e-12)
+    def _norm_t(self, t):
+        return (t - self._t0) / (self._dt + 1e-12)
 
     def fit(self, t_obs, x_obs, y_obs, verbose=True):
-        rng = np.random.default_rng(self.seed)
+        torch.manual_seed(self.seed)
         cfg = self.cfg
 
-        self._t0 = t_obs.min(); self._dt = t_obs.max()-t_obs.min()
-        self._x0 = x_obs.min(); self._xs = max(x_obs.max()-x_obs.min(),1e-3)
-        self._y0 = y_obs.min(); self._ys = max(y_obs.max()-y_obs.min(),1e-3)
+        # --- Normalisation constants ---
+        self._t0 = float(t_obs.min()); self._dt = float(t_obs.max() - t_obs.min())
+        self._x0 = float(x_obs.min()); self._xs = float(max(x_obs.max()-x_obs.min(), 1e-3))
+        self._y0 = float(y_obs.min()); self._ys = float(max(y_obs.max()-y_obs.min(), 1e-3))
 
-        tn   = self._norm_t(t_obs)
-        xn   = (x_obs-self._x0)/self._xs
-        yn   = (y_obs-self._y0)/self._ys
-        tc   = np.linspace(0,1,self.n_coll)
-        data = np.stack([xn,yn],1)
+        # --- Normalised observations (torch) ---
+        tn  = torch.tensor(self._norm_t(t_obs), dtype=torch.float32).reshape(-1, 1)
+        xn  = torch.tensor((x_obs - self._x0) / self._xs, dtype=torch.float32)
+        yn  = torch.tensor((y_obs - self._y0) / self._ys, dtype=torch.float32)
+        data = torch.stack([xn, yn], dim=1)   # (N, 2)
 
-        sizes = [1]+[self.neurons]*self.hidden+[2]
-        self._sizes = sizes
+        # --- Collocation points (cover 2x obs window for extrapolation) ---
+        tc = torch.linspace(0.0, 2.0, self.n_coll, requires_grad=True).reshape(-1, 1)
 
-        K = RHO*np.pi*cfg["radius_m"]**2/(2*cfg["mass_kg"])
-        R = cfg["radius_m"]
-        CD0 = cfg["drag_coeff"]
-        ts, xs_sc, ys_sc = self._dt, self._xs, self._ys
+        # --- Physics scaling ---
+        K     = RHO * np.pi * cfg["radius_m"]**2 / (2 * cfg["mass_kg"])
+        R     = cfg["radius_m"]
+        ts    = self._dt
+        xs_sc = self._xs
+        ys_sc = self._ys
 
-        init = _xavier(sizes, rng)
-        lam0 = [np.log(CD0)] + ([np.log(30.)] if cfg["has_spin"] else [])
-        theta0 = np.concatenate([_pack(init), lam0])
+        # --- Build model + optimiser ---
+        net = _PINNNet(self.hidden, self.neurons)
+        if not cfg["has_spin"]:
+            net.log_om.requires_grad_(False)
 
-        n_nn = sum((a+1)*b for a,b in zip(sizes,sizes[1:]))
+        optimizer = torch.optim.Adam(net.parameters(), lr=5e-3)
+        # Cosine annealing scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.max_iter, eta_min=1e-5)
 
-        def loss(theta):
-            layers = _unpack(theta[:n_nn], sizes)
-            lam    = theta[n_nn:]
-            CD     = np.exp(lam[0])
-
-            # Data loss
-            tdc = tn.reshape(-1,1)
-            pred= _fwd(tdc, layers)
-            Ls  = np.mean((pred-data)**2)
-
-            # Physics loss
-            tcc = tc.reshape(-1,1)
-            vn  = _d(tcc, layers, 1)
-            an  = _d(tcc, layers, 2)
-            vx  = vn[:,0:1]*(xs_sc/ts)
-            vy  = vn[:,1:2]*(ys_sc/ts)
-            ax  = an[:,0:1]*(xs_sc/ts**2)
-            ay  = an[:,1:2]*(ys_sc/ts**2)
-            V   = np.sqrt(vx**2+vy**2)+1e-9
-
-            fx = ax + K*V*CD*vx
-            fy = ay + G + K*V*CD*vy
-
-            if cfg["has_spin"] and len(lam)>1:
-                om  = np.exp(lam[1])
-                CL  = 1./(2.+(R*om/V)**(-1)+1e-9)
-                on  = abs(om)+1e-9
-                fx += -K*V*(CL/on)*(om*vy)
-                fy +=  K*V*(CL/on)*(om*vx)
-
-            Lf = np.mean((fx/G)**2)+np.mean((fy/G)**2)
-            return (1-self.beta)*Ls + self.beta*Lf
-
-        hist=[]; itr=[0]
-        def cb(xk):
-            itr[0]+=1
-            if itr[0]%200==0:
-                v=loss(xk); hist.append(v)
-                if verbose:
-                    lam=xk[n_nn:]
-                    print(f"  [PINN] iter {itr[0]:4d}  loss={v:.3e}  "
-                          f"CD={np.exp(lam[0]):.3f}")
+        mse = nn.MSELoss()
+        hist = []
 
         if verbose:
             print(f"\n[PINN] Fitting {cfg['display_name']} | "
                   f"{len(t_obs)} pts | spin={cfg['has_spin']}")
 
-        res = minimize(loss, theta0, method="L-BFGS-B", callback=cb,
-                       options={"maxiter":self.max_iter,"ftol":1e-15,"gtol":1e-10})
+        for epoch in range(self.max_iter):
+            optimizer.zero_grad()
 
-        self._layers = _unpack(res.x[:n_nn], sizes)
-        self._lam    = res.x[n_nn:]
-        self._n_nn   = n_nn
+            # ── Data loss ────────────────────────────────────────────────────
+            pred = net(tn)
+            loss_data = mse(pred, data)
+
+            # ── Physics loss (exact autograd derivatives) ─────────────────────
+            tc_fresh = tc.detach().clone().requires_grad_(True)
+            out = net(tc_fresh)          # (N_coll, 2)
+            xn_c = out[:, 0:1]
+            yn_c = out[:, 1:2]
+
+            # First derivatives d(x_n)/d(t_n), d(y_n)/d(t_n)
+            dxn_dt = torch.autograd.grad(xn_c, tc_fresh,
+                        grad_outputs=torch.ones_like(xn_c),
+                        create_graph=True)[0]
+            dyn_dt = torch.autograd.grad(yn_c, tc_fresh,
+                        grad_outputs=torch.ones_like(yn_c),
+                        create_graph=True)[0]
+
+            # Second derivatives
+            d2xn_dt2 = torch.autograd.grad(dxn_dt, tc_fresh,
+                        grad_outputs=torch.ones_like(dxn_dt),
+                        create_graph=True)[0]
+            d2yn_dt2 = torch.autograd.grad(dyn_dt, tc_fresh,
+                        grad_outputs=torch.ones_like(dyn_dt),
+                        create_graph=True)[0]
+
+            # Physical velocities / accelerations
+            vx = dxn_dt * (xs_sc / ts)
+            vy = dyn_dt * (ys_sc / ts)
+            ax = d2xn_dt2 * (xs_sc / ts**2)
+            ay = d2yn_dt2 * (ys_sc / ts**2)
+            V  = torch.sqrt(vx**2 + vy**2) + 1e-9
+
+            CD = torch.exp(net.log_CD)
+
+            # Projectile ODE residual:  a + drag + gravity = 0
+            fx = ax + K * V * CD * vx                     # x-residual
+            fy = ay + G + K * V * CD * vy                 # y-residual
+
+            # Magnus / spin lift
+            if cfg["has_spin"]:
+                om = torch.exp(net.log_om)
+                CL = 1.0 / (2.0 + (R * om / V)**(-1) + 1e-9)
+                fx = fx - K * V * (CL / om) * (om * vy)
+                fy = fy + K * V * (CL / om) * (om * vx)
+
+            loss_phys = (fx**2).mean() + (fy**2).mean()
+
+            # ── Total loss ────────────────────────────────────────────────────
+            loss = (1.0 - self.beta) * loss_data + self.beta * loss_phys
+
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            if epoch % 200 == 0:
+                lv = float(loss.item())
+                hist.append(lv)
+                if verbose:
+                    print(f"  [PINN] epoch {epoch:4d}  loss={lv:.3e}  "
+                          f"CD={float(CD.item()):.3f}")
+
+        self._net = net
         self.loss_history = hist
         self._trained = True
 
         if verbose:
-            kin=self.kinematics()
-            print(f"[PINN] Done  loss={res.fun:.3e}  "
+            kin = self.kinematics()
+            print(f"[PINN] Done  loss={float(loss.item()):.3e}  "
                   f"V0={kin['speed']:.2f}m/s  CD={kin['CD']:.3f}")
         return self
 
     def predict(self, t_query):
-        tn  = self._norm_t(np.asarray(t_query)).reshape(-1,1)
-        out = _fwd(tn, self._layers)
-        return out[:,0]*self._xs+self._x0, out[:,1]*self._ys+self._y0
+        self._net.eval()
+        tn = torch.tensor(
+            self._norm_t(np.asarray(t_query, dtype=np.float64)),
+            dtype=torch.float32).reshape(-1, 1)
+        with torch.no_grad():
+            out = self._net(tn).numpy()
+        return (out[:, 0] * self._xs + self._x0,
+                out[:, 1] * self._ys + self._y0)
 
     def kinematics(self):
-        CD = float(np.exp(self._lam[0]))
-        om = float(np.exp(self._lam[1])) if len(self._lam)>1 else 0.
-        t0 = np.array([[0.]])
-        vn = _d(t0, self._layers, 1)
-        vx = float(vn[0,0])*self._xs/self._dt
-        vy = float(vn[0,1])*self._ys/self._dt
-        return {"CD": CD, "spin_rps": om/(2*np.pi),
+        net = self._net
+        CD  = float(torch.exp(net.log_CD).item())
+        om  = float(torch.exp(net.log_om).item()) if self.cfg["has_spin"] else 0.0
+
+        with torch.enable_grad():
+            # Two independent forward passes so each has its own graph
+            t0x = torch.tensor([[0.0]], requires_grad=True)
+            dvx = torch.autograd.grad(net(t0x)[0, 0], t0x)[0]
+            t0y = torch.tensor([[0.0]], requires_grad=True)
+            dvy = torch.autograd.grad(net(t0y)[0, 1], t0y)[0]
+        vx = float(dvx.item()) * self._xs / self._dt
+        vy = float(dvy.item()) * self._ys / self._dt
+        return {"CD": CD, "spin_rps": om / (2 * np.pi),
                 "vx0": vx, "vy0": vy,
-                "speed": float(np.sqrt(vx**2+vy**2))}
+                "speed": float(np.sqrt(vx**2 + vy**2))}
 
     def classify(self):
         kin = self.kinematics()
-        tm  = np.array([[0.5]])
-        acc = _d(tm, self._layers, 2)
-        sign = -np.sign(float(acc[0,1]))
-        rps  = sign*kin["spin_rps"]
+        net = self._net
+        with torch.enable_grad():
+            tm  = torch.tensor([[0.5]], requires_grad=True)
+            out = net(tm)
+            yn_m = out[0, 1:2]
+            dvy  = torch.autograd.grad(yn_m, tm, create_graph=True)[0]
+            d2vy = torch.autograd.grad(dvy,  tm, create_graph=False)[0]
+        sign = -np.sign(float(d2vy.item()))
+        rps  = sign * kin["spin_rps"]
         return self.cfg["classify"](kin["speed"], rps), rps, kin["speed"]
 
 
