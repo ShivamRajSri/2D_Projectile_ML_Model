@@ -105,7 +105,7 @@ OBJECTS = {
         "drag_coeff":   0.55,
         "has_spin":     True,
         "colors":       ["yellow", "green"],
-        "min_radius_px": 5, "max_radius_px": 40,
+        "min_radius_px": 1, "max_radius_px": 40,
         "scene_width_m": 23.77,
         "classify":     _cls_tennis,
         "presets": {

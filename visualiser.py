@@ -137,30 +137,67 @@ def plot_metrics(results, save_path=None):
 # 3. Velocity profile
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_velocity(t_obs, x_obs, y_obs, kin=None, save_path=None):
+def plot_velocity(t_obs, x_obs, y_obs, kin=None, pinn_model=None, save_path=None):
     dt  = np.diff(t_obs)+1e-9
     vx  = np.diff(x_obs)/dt
     vy  = np.diff(y_obs)/dt
     spd = np.sqrt(vx**2+vy**2)
     tm  = (t_obs[:-1]+t_obs[1:])/2
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     fig.suptitle("Velocity Analysis", fontsize=13, fontweight="bold")
 
-    axes[0].plot(tm, vx, color="#3498DB", lw=2)
+    axes[0].plot(tm, vx, color="#3498DB", lw=2, alpha=0.7, label="Measured vx")
     axes[0].set_xlabel("t [s]"); axes[0].set_ylabel("vx [m/s]")
     axes[0].set_title("Horizontal Velocity"); axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(tm, vy, color="#E74C3C", lw=2)
+    axes[1].plot(tm, vy, color="#E74C3C", lw=2, alpha=0.7, label="Measured vy")
     axes[1].set_xlabel("t [s]"); axes[1].set_ylabel("vy [m/s]")
     axes[1].set_title("Vertical Velocity"); axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(tm, spd, color="#27AE60", lw=2, label="Measured speed")
-    if kin:
-        axes[2].axhline(kin["speed"], ls="--", color="#E74C3C",
-                        lw=1.5, label=f"PINN V₀={kin['speed']:.1f} m/s")
+    axes[2].plot(tm, spd, color="#27AE60", lw=2, alpha=0.7, label="Measured speed")
     axes[2].set_xlabel("t [s]"); axes[2].set_ylabel("speed [m/s]")
-    axes[2].set_title("Speed Profile"); axes[2].legend(); axes[2].grid(True, alpha=0.3)
+    axes[2].set_title("Speed Profile"); axes[2].grid(True, alpha=0.3)
+
+    if pinn_model and getattr(pinn_model, "_trained", False):
+        import torch
+        # PINN exact derivatives (two independent forward passes to avoid graph destruction)
+        tn_x = torch.tensor(pinn_model._norm_t(tm), dtype=torch.float32).reshape(-1, 1)
+        tn_x.requires_grad_(True)
+        xn_c = pinn_model._net(tn_x)[:, 0:1]
+        dxn_dt = torch.autograd.grad(xn_c, tn_x, grad_outputs=torch.ones_like(xn_c))[0]
+        
+        tn_y = torch.tensor(pinn_model._norm_t(tm), dtype=torch.float32).reshape(-1, 1)
+        tn_y.requires_grad_(True)
+        yn_c = pinn_model._net(tn_y)[:, 1:2]
+        dyn_dt = torch.autograd.grad(yn_c, tn_y, grad_outputs=torch.ones_like(yn_c))[0]
+        
+        vx_pinn = (dxn_dt.detach().numpy().flatten() * (pinn_model._xs / pinn_model._dt))
+        vy_pinn = (dyn_dt.detach().numpy().flatten() * (pinn_model._ys / pinn_model._dt))
+        spd_pinn = np.sqrt(vx_pinn**2 + vy_pinn**2)
+        
+        axes[0].plot(tm, vx_pinn, ls="--", color="#F39C12", lw=2, label="PINN")
+        axes[1].plot(tm, vy_pinn, ls="--", color="#F39C12", lw=2, label="PINN")
+        axes[2].plot(tm, spd_pinn, ls="--", color="#F39C12", lw=2, label="PINN")
+
+    for ax in axes:
+        ax.legend()
+        y_min, y_max = ax.get_ylim()
+        margin = (y_max - y_min) * 0.1 if y_max > y_min else 1.0
+        
+        if y_min >= 0:
+            ax.set_ylim(bottom=0, top=y_max + margin)
+        elif y_max <= 0:
+            ax.set_ylim(bottom=y_min - margin, top=0)
+        else:
+            ax.set_ylim(bottom=y_min - margin, top=y_max + margin)
+            
+        # Force strict (0,0) Cartesian origin
+        ax.set_xlim(left=0)
+        ax.spines['bottom'].set_position('zero')
+        ax.spines['left'].set_position('zero')
+        ax.spines['top'].set_color('none')
+        ax.spines['right'].set_color('none')
 
     plt.tight_layout()
     if save_path:
