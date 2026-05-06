@@ -513,7 +513,7 @@ def predict_all(cfg, t_obs, x_obs, y_obs, t_gt, x_gt, y_gt,
 
     # ── 4. Parabolic Regression (classical baseline) ──────────────────────────
     x_fut = np.interp(t_query, t_obs,
-                      np.linspace(x_obs.min(), x_obs.max(), len(t_obs)))
+                      np.linspace(x_obs[0], x_obs[-1], len(t_obs)))
     y_par, coeffs = parabolic_fit(x_obs, y_obs, x_fut)
     results["parabolic"] = {
         "x_pred":  x_fut, "y_pred": y_par,

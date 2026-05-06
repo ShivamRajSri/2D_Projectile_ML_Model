@@ -57,8 +57,6 @@ def parse_args():
                    help="Use synthetic simulation instead of real video")
     p.add_argument("--demo",        action="store_true",
                    help="Run all objects and produce comparison report")
-    p.add_argument("--interactive", action="store_true",
-                   help="Use manual interactive point selection instead of RANSAC")
     p.add_argument("--list",        action="store_true",
                    help="List all available objects and exit")
     p.add_argument("--no-bg-sub",   action="store_true")
@@ -169,132 +167,110 @@ def load_video(cfg, args):
                 writer.writerow([f"{ti:.4f}", f"{xi:.4f}", f"{yi:.4f}"])
         print(f"[data] Raw trajectory (unfiltered) saved to: {csv_path}")
 
-    if args.interactive:
-        t, x, y  = clean(det["times"], x_m, y_m)
+    t, x, y  = clean(det["times"], x_m, y_m)
 
-        # Interactive Point Selection
-        import numpy as np
-        print("\n[+] Launching interactive point selector...")
+    # Interactive Point Selection
+    import numpy as np
+    print("\n[+] Launching interactive point selector...")
+    
+    W_plot, H_plot = 800, 600
+    margin = 50
+    active = np.ones(len(t), dtype=bool)
+    
+    min_t, max_t = t.min(), t.max()
+    min_y, max_y = y.min(), y.max()
+    span_t = max(max_t - min_t, 1e-3)
+    span_y = max(max_y - min_y, 1e-3)
+    
+    def to_px(ti, yi):
+        px = int(margin + (ti - min_t) / span_t * (W_plot - 2*margin))
+        py = int(H_plot - margin - (yi - min_y) / span_y * (H_plot - 2*margin))
+        return px, py
         
-        W_plot, H_plot = 800, 600
-        margin = 50
-        active = np.ones(len(t), dtype=bool)
+    pts_px = [to_px(t[i], y[i]) for i in range(len(t))]
+    
+    lasso_pts = []
+    
+    def on_mouse(event, mx, my, flags, param):
+        nonlocal lasso_pts
         
-        min_t, max_t = t.min(), t.max()
-        min_y, max_y = y.min(), y.max()
-        span_t = max(max_t - min_t, 1e-3)
-        span_y = max(max_y - min_y, 1e-3)
-        
-        def to_px(ti, yi):
-            px = int(margin + (ti - min_t) / span_t * (W_plot - 2*margin))
-            py = int(H_plot - margin - (yi - min_y) / span_y * (H_plot - 2*margin))
-            return px, py
+        if event == cv2.EVENT_LBUTTONDOWN:
+            lasso_pts = [(mx, my)]
             
-        pts_px = [to_px(t[i], y[i]) for i in range(len(t))]
-        
-        lasso_pts = []
-        
-        def on_mouse(event, mx, my, flags, param):
-            nonlocal lasso_pts
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if (flags & cv2.EVENT_FLAG_LBUTTON) and lasso_pts:
+                if (mx - lasso_pts[-1][0])**2 + (my - lasso_pts[-1][1])**2 > 9:
+                    lasso_pts.append((mx, my))
+                    draw()
+                    
+        elif event == cv2.EVENT_LBUTTONUP:
+            if not lasso_pts:
+                return
             
-            if event == cv2.EVENT_LBUTTONDOWN:
-                lasso_pts = [(mx, my)]
-                
-            elif event == cv2.EVENT_MOUSEMOVE:
-                if (flags & cv2.EVENT_FLAG_LBUTTON) and lasso_pts:
-                    if (mx - lasso_pts[-1][0])**2 + (my - lasso_pts[-1][1])**2 > 9:
-                        lasso_pts.append((mx, my))
-                        draw()
-                        
-            elif event == cv2.EVENT_LBUTTONUP:
-                if not lasso_pts:
-                    return
-                
-                is_drag = False
-                if len(lasso_pts) > 5:
-                    pts_arr = np.array(lasso_pts)
-                    if pts_arr[:, 0].max() - pts_arr[:, 0].min() > 10 or pts_arr[:, 1].max() - pts_arr[:, 1].min() > 10:
-                        is_drag = True
-                        
-                if is_drag:
-                    cnt = np.array(lasso_pts, dtype=np.int32)
-                    for i, p in enumerate(pts_px):
-                        if active[i]:
-                            if cv2.pointPolygonTest(cnt, (float(p[0]), float(p[1])), False) >= 0:
-                                active[i] = False
-                else:
-                    best_idx = -1
-                    best_dist = float('inf')
-                    for i, (px, py) in enumerate(pts_px):
-                        dist = (px - mx)**2 + (py - my)**2
-                        if dist < 400: 
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_idx = i
-                    if best_idx != -1:
-                        active[best_idx] = not active[best_idx]
-                
-                lasso_pts = []
-                draw()
+            is_drag = False
+            if len(lasso_pts) > 5:
+                pts_arr = np.array(lasso_pts)
+                if pts_arr[:, 0].max() - pts_arr[:, 0].min() > 10 or pts_arr[:, 1].max() - pts_arr[:, 1].min() > 10:
+                    is_drag = True
+                    
+            if is_drag:
+                cnt = np.array(lasso_pts, dtype=np.int32)
+                for i, p in enumerate(pts_px):
+                    if active[i]:
+                        if cv2.pointPolygonTest(cnt, (float(p[0]), float(p[1])), False) >= 0:
+                            active[i] = False
+            else:
+                best_idx = -1
+                best_dist = float('inf')
+                for i, (px, py) in enumerate(pts_px):
+                    dist = (px - mx)**2 + (py - my)**2
+                    if dist < 400: 
+                        if dist < best_dist:
+                            best_dist = dist
+                            best_idx = i
+                if best_idx != -1:
+                    active[best_idx] = not active[best_idx]
+            
+            lasso_pts = []
+            draw()
 
-        win_name = "Select Points (Blue=Keep, Red=Discard)"
-        cv2.namedWindow(win_name)
-        cv2.setMouseCallback(win_name, on_mouse)
+    win_name = "Select Points (Blue=Keep, Red=Discard)"
+    cv2.namedWindow(win_name)
+    cv2.setMouseCallback(win_name, on_mouse)
+    
+    def draw():
+        img = np.ones((H_plot, W_plot, 3), dtype=np.uint8) * 40
+        cv2.putText(img, "L-Click: Toggle point. L-Click & Drag: Lasso remove.", 
+                    (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        cv2.putText(img, "Press 'q', 'Space', or 'Enter' when done.", 
+                    (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+        cv2.putText(img, "Plot: X-Axis = Time (t)  |  Y-Axis = Vertical Pos (y)", 
+                    (15, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
         
-        def draw():
-            img = np.ones((H_plot, W_plot, 3), dtype=np.uint8) * 40
-            cv2.putText(img, "L-Click: Toggle point. L-Click & Drag: Lasso remove.", 
-                        (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-            cv2.putText(img, "Press 'q', 'Space', or 'Enter' when done.", 
-                        (15, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-            cv2.putText(img, "Plot: X-Axis = Time (t)  |  Y-Axis = Vertical Pos (y)", 
-                        (15, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        for i in range(len(t)):
+            color = (255, 100, 50) if active[i] else (0, 0, 255)
+            cv2.circle(img, pts_px[i], 6, color, -1)
+            cv2.circle(img, pts_px[i], 6, (255,255,255), 1)
             
-            for i in range(len(t)):
-                color = (255, 100, 50) if active[i] else (0, 0, 255)
-                cv2.circle(img, pts_px[i], 6, color, -1)
-                cv2.circle(img, pts_px[i], 6, (255,255,255), 1)
-                
-            if len(lasso_pts) > 1:
-                pts = np.array(lasso_pts, np.int32).reshape((-1, 1, 2))
-                cv2.polylines(img, [pts], isClosed=False, color=(0, 255, 255), thickness=2)
-                
-            cv2.imshow(win_name, img)
+        if len(lasso_pts) > 1:
+            pts = np.array(lasso_pts, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(img, [pts], isClosed=False, color=(0, 255, 255), thickness=2)
             
-        draw()
-        while True:
-            key = cv2.waitKey(30) & 0xFF
-            if key in (ord('q'), 13, 27, ord(' ')):
-                break
-                
-        cv2.destroyWindow(win_name)
+        cv2.imshow(win_name, img)
+        
+    draw()
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+        if key in (ord('q'), 13, 27, ord(' ')):
+            break
+            
+    cv2.destroyWindow(win_name)
 
-        t = t[active]
-        x = x[active]
-        y = y[active]
+    t = t[active]
+    x = x[active]
+    y = y[active]
 
-        print(f"[data] {len(t)} clean positions kept")
-    else:
-        from filterer import filter_projectile_ransac
-        import numpy as np
-        
-        t_raw = np.array(det["times"])
-        x_raw = np.array(x_m)
-        y_raw = np.array(y_m)
-        
-        print("\n[+] Running RANSAC trajectory filter...")
-        model_coeffs, inliers = filter_projectile_ransac(t_raw, y_raw)
-        
-        if model_coeffs is not None:
-            t = t_raw[inliers]
-            x = x_raw[inliers]
-            y = y_raw[inliers]
-            a, b, c = model_coeffs
-            print(f"[data] RANSAC Found: y = {a:.2f}t^2 + {b:.2f}t + {c:.2f}")
-            print(f"[data] {len(t)} true points kept (removed {len(t_raw)-len(t)} noise points)")
-        else:
-            print("[!] RANSAC failed to find valid trajectory, falling back to basic clean()")
-            t, x, y = clean(det["times"], x_m, y_m)
+    print(f"[data] {len(t)} clean positions kept")
 
     return t, x, y, {"det": det, "simulated": False}
 
