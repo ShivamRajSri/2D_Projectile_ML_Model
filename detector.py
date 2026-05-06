@@ -28,12 +28,15 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     # Combine masks for all candidate colours
-    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
-    for ck in color_keys:
-        if ck in COLORS:
-            cr   = COLORS[ck]
-            m    = cv2.inRange(hsv, cr["lower"], cr["upper"])
-            mask = cv2.bitwise_or(mask, m)
+    if "any" in color_keys or not color_keys:
+        mask = np.ones(frame.shape[:2], dtype=np.uint8) * 255
+    else:
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        for ck in color_keys:
+            if ck in COLORS:
+                cr   = COLORS[ck]
+                m    = cv2.inRange(hsv, cr["lower"], cr["upper"])
+                mask = cv2.bitwise_or(mask, m)
 
     # Foreground gating
     if bg_sub is not None:
@@ -41,10 +44,13 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
         fg   = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)[1]
         mask = cv2.bitwise_and(mask, fg)
 
-    # Morphological cleanup
-    k    = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    # 1. Aggressive Morphology
+    # A larger kernel for MORPH_OPEN will erase scattered 1-2 pixel noise.
+    # A very large kernel for MORPH_CLOSE will fuse the ball into a solid mass.
+    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=2)
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
@@ -53,8 +59,12 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
     best, best_score = None, -1
     for cnt in cnts:
         area = cv2.contourArea(cnt)
-        if area < 4:
+        
+        # 2. Strict Area Filtering
+        # A tiny ball is usually 5 to 50 pixels. A human body/arm is 500+ pixels.
+        if area < 1 or area > 300: 
             continue
+            
         (cx, cy), r = cv2.minEnclosingCircle(cnt)
         if not (min_r <= r <= max_r):
             continue
@@ -64,7 +74,7 @@ def detect_frame(frame, color_keys, min_r=3, max_r=80, bg_sub=None):
             best_score = circ
             best = (float(cx), float(cy), float(r))
 
-    return best if (best and best_score > 0.25) else None
+    return best if (best and best_score > 0.6) else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,7 +119,7 @@ def extract_trajectory(video_path, cfg,
     min_r   = cfg.get("min_radius_px", 3)
     max_r   = cfg.get("max_radius_px", 80)
     bg_sub  = cv2.createBackgroundSubtractorMOG2(
-                  history=200, varThreshold=40, detectShadows=False
+                  history=500, varThreshold=16, detectShadows=False
               ) if use_bg_sub else None
 
     writer = None
